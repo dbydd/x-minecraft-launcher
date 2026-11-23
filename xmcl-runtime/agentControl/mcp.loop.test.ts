@@ -99,7 +99,7 @@ class FixturePort implements LauncherPort {
       })
     }
     await writeFile(join(instanceId, 'runtime.txt'), '1.21.1')
-    return { version: '1.21.1' }
+    return { version: '1.21.1', side: 'client' as const }
   }
 
   async launch(instanceId: InstanceId, signal: AbortSignal) {
@@ -132,7 +132,14 @@ class FixturePort implements LauncherPort {
   }
 
   async readLog(instanceId: InstanceId, name: string) {
-    return readFile(join(instanceId, 'logs', name), 'utf8')
+    try {
+      return { exists: true, content: await readFile(join(instanceId, 'logs', name), 'utf8') }
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+        return { exists: false, content: '' }
+      }
+      throw error
+    }
   }
 }
 
@@ -309,8 +316,13 @@ describe('MCP agent control loop', () => {
       name: 'latest.log',
       tailLines: 5,
     })
+    expect(log.data.exists).toBe(true)
     expect(log.data.lines).toEqual(lines.slice(-5))
     expect(log.data.truncated).toBe(true)
+    const missing = await tool(token, session, 'logs_read', { instanceId, name: 'missing.log' })
+    expect(missing.data.exists).toBe(false)
+    expect(missing.data.lines).toEqual([])
+    expect(missing.data.returned).toBe(0)
     expect(log.raw.includes(port.sentinel)).toBe(false)
 
     const denied = await client!.callTool({ name: 'getOfficialUserProfile', arguments: {} })

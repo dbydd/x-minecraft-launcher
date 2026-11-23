@@ -40,6 +40,23 @@ function makeRegistry() {
     cli: { name: 'user list' },
     async handler() { return undefined },
   }))
+  reg.register(defineCommand({
+    id: 'user.login',
+    title: 'Login',
+    category: 'user',
+    input: z.object({
+      authority: z.string().optional(),
+      username: z.string().optional(),
+    }),
+    cli: {
+      name: 'user login',
+      flags: {
+        authority: { alias: 'a' },
+        username: { alias: 'u' },
+      },
+    },
+    async handler() { return undefined },
+  }))
   return reg
 }
 
@@ -161,10 +178,20 @@ describe('parseCli — positionals + flags', () => {
   })
 
   test('multi-word command name (user list)', () => {
-    // For now `user list` would require separate matching logic; verify
-    // single-word fallback continues to work.
     const r = parseCli(['user list'], makeRegistry())
     expect(r).toMatchObject({ kind: 'command', commandId: 'user.list', input: {} })
+  })
+
+  test('multi-word command matches separate argv tokens', () => {
+    const r = parseCli(
+      ['electron', 'app.js', 'user', 'login', '--authority', 'offline', '--username', 'XmclIsolated'],
+      makeRegistry(),
+    )
+    expect(r).toMatchObject({
+      kind: 'command',
+      commandId: 'user.login',
+      input: { authority: 'offline', username: 'XmclIsolated' },
+    })
   })
 })
 

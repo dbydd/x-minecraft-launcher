@@ -1,6 +1,13 @@
 import { z } from 'zod'
+import { AUTHORITY_DEV, AUTHORITY_MICROSOFT } from '../../util/authority'
 import { defineCommand } from '../registry'
 import { UserServiceKey } from '../../services/UserService'
+
+function resolveAuthority(authority: string) {
+  if (authority === 'offline') return AUTHORITY_DEV
+  if (authority === 'microsoft') return AUTHORITY_MICROSOFT
+  return authority
+}
 
 /**
  * Login a user account. Authority defaults to the official Microsoft
@@ -35,7 +42,7 @@ export const loginUserCommand = defineCommand({
     const profile = await ctx.call(UserServiceKey, 'login', {
       username: username ?? '',
       password: input.password,
-      authority: input.authority,
+      authority: resolveAuthority(input.authority),
     })
     ctx.out.log(`Logged in as ${profile.username} (${profile.id})`)
     ctx.out.json({ ok: true, command: 'user.login', data: { id: profile.id, username: profile.username, authority: profile.authority } })

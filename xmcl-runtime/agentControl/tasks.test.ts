@@ -73,4 +73,21 @@ describe('task cancellation', () => {
     expect(await readFile(file, 'utf8')).toBe('partial-bytes')
     await rm(directory, { recursive: true, force: true })
   })
+
+  test('a failed task keeps the error code and recovery hint', async () => {
+    const book = new TaskBook()
+    const id = book.start(async () => {
+      throw Object.assign(new Error('User selection required'), {
+        name: 'CommandMissingInput',
+      })
+    })
+    await wait(20)
+    const done = book.poll(id)
+    expect(done?.state).toBe('failed')
+    expect(done?.error).toMatchObject({
+      code: 'account_required',
+      retryable: false,
+    })
+    expect(done?.error?.hint).toContain('x://dev')
+  })
 })

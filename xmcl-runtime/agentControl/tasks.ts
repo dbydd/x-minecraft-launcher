@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { asTaskId, type TaskId, type TaskView } from '@xmcl/runtime-api'
+import { asTaskId, type TaskError, type TaskId, type TaskView } from '@xmcl/runtime-api'
 
 interface RecordedTask {
   taskId: TaskId
@@ -8,7 +8,35 @@ interface RecordedTask {
   effect: TaskView['effect']
   controller: AbortController
   result?: unknown
-  error?: string
+  error?: TaskError
+}
+
+function taskError(error: unknown): TaskError {
+  const message = error instanceof Error ? error.message : String(error)
+  const record =
+    error && typeof error === 'object'
+      ? (error as { code?: unknown; name?: unknown; hint?: unknown; retryable?: unknown })
+      : {}
+  if (record.name === 'CommandMissingInput' && /user selection required/i.test(message)) {
+    return {
+      code: 'account_required',
+      message: 'No account is selected',
+      retryable: false,
+      hint: 'Log in with the launcher user.login command. Offline accounts use authority x://dev, or the CLI alias offline, plus a username. Pass that account id as launch.user. This interface does not create accounts or return tokens.',
+    }
+  }
+  const code =
+    typeof record.code === 'string' && record.code !== 'task_cancelled'
+      ? record.code
+      : typeof record.name === 'string' && record.name !== 'Error'
+        ? record.name
+        : 'failed'
+  return {
+    code,
+    message,
+    retryable: record.retryable === true,
+    hint: typeof record.hint === 'string' ? record.hint : undefined,
+  }
 }
 
 function cancelledError(error: unknown) {
@@ -58,13 +86,13 @@ export class TaskBook {
           record.state = 'cancelled'
           record.cancellation = 'honored'
           record.effect = reportedEffect(error)
-          record.error = error instanceof Error ? error.message : String(error)
+          record.error = taskError(error)
           return
         }
         record.state = 'failed'
-        record.effect = 'unknown'
+        record.effect = typeof error === 'object' && error && 'effect' in error ? reportedEffect(error) : 'unknown'
         if (record.cancellation === 'requested') record.cancellation = 'unsupported'
-        record.error = error instanceof Error ? error.message : String(error)
+        record.error = taskError(error)
       },
     )
     return taskId

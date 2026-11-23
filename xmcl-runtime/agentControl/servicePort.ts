@@ -1,3 +1,5 @@
+import { access } from 'node:fs/promises'
+import { join } from 'node:path'
 import { asInstanceId } from '@xmcl/runtime-api'
 import type { LauncherPort } from './port'
 
@@ -30,6 +32,7 @@ export interface XmclControlServices {
       runtime: object
       selectedVersion?: string
     }): Promise<{ version: string }>
+    install(request: { type: 'server'; runtime: object; path: string }): Promise<string>
   }
   processes: {
     kill(pid: number, force?: boolean): Promise<void>
@@ -39,6 +42,7 @@ export interface XmclControlServices {
   }
   logs: {
     getLogContent(instancePath: string, name: string): Promise<string>
+    getServerLogContent(instancePath: string, name: string): Promise<string>
   }
   commands: {
     dispatch(
@@ -50,7 +54,16 @@ export interface XmclControlServices {
 }
 
 function cancelled() {
-  return Object.assign(new Error('task cancelled'), { code: 'task_cancelled' })
+  return Object.assign(new Error('task cancelled'), { code: 'task_cancelled', effect: 'none' as const })
+}
+
+function accountRequired(error: unknown) {
+  return (
+    !!error &&
+    typeof error === 'object' &&
+    (error as { name?: string }).name === 'CommandMissingInput' &&
+    /user selection required/i.test(error instanceof Error ? error.message : '')
+  )
 }
 
 /**
@@ -106,27 +119,62 @@ export function createServiceLauncherPort(services: XmclControlServices): Launch
       const imported = await services.modpack.importModpack(modpackPath)
       return { instanceId: asInstanceId(imported.instancePath) }
     },
-    async installRuntime(instanceId, signal) {
+    async installRuntime(instanceId, signal, side = 'client') {
       if (signal.aborted) throw cancelled()
       const state = await services.instances.getSharedInstancesState()
       const instance = state.all[instanceId]
-      if (!instance) throw new Error(`Instance not found: ${instanceId}`)
+      if (!instance) {
+        throw Object.assign(new Error(`Instance not found: ${instanceId}`), {
+          code: 'not_found',
+          retryable: false,
+        })
+      }
+      if (side === 'server') {
+        const version = await services.versions.install({
+          type: 'server',
+          runtime: instance.runtime ?? {},
+          path: instanceId,
+        })
+        return { version, side }
+      }
       const installed = await services.versions.installInstance({
         type: 'instance',
         instancePath: instanceId,
         runtime: instance.runtime ?? {},
         selectedVersion: instance.version,
       })
-      return { version: installed.version }
+      return { version: installed.version, side }
     },
-    async launch(instanceId, signal) {
+    async launch(instanceId, signal, options) {
       if (signal.aborted) throw cancelled()
-      const pid = await services.commands.dispatch(
-        'instance.launch',
-        { instance: instanceId, modCount: 0 },
-        { mode: 'cli', signal },
-      )
-      if (typeof pid !== 'number') throw new Error('Launch did not return a process id')
+      let pid: unknown
+      try {
+        pid = await services.commands.dispatch(
+          'instance.launch',
+          {
+            instance: instanceId,
+            modCount: 0,
+            side: options?.side ?? 'client',
+            ...(options?.user ? { user: options.user } : {}),
+          },
+          { mode: 'cli', signal },
+        )
+      } catch (error) {
+        if (accountRequired(error)) {
+          throw Object.assign(new Error('No account is selected'), {
+            code: 'account_required',
+            retryable: false,
+            hint: 'Log in with the launcher user.login command. Offline accounts use authority x://dev, or the CLI alias offline, plus a username. Pass that account id as launch.user. This interface does not create accounts or return tokens.',
+          })
+        }
+        throw error
+      }
+      if (typeof pid !== 'number') {
+        throw Object.assign(new Error('Launch did not return a process id'), {
+          code: 'launch_failed',
+          retryable: false,
+        })
+      }
       return { pid }
     },
     async listProcesses(instanceId) {
@@ -143,8 +191,18 @@ export function createServiceLauncherPort(services: XmclControlServices): Launch
       if (!owned) throw new Error('Process is not running for this instance')
       await services.processes.kill(pid, force)
     },
-    readLog(instanceId, name) {
-      return services.logs.getLogContent(instanceId, name)
+    async readLog(instanceId, name, side = 'client') {
+      const file = join(instanceId, ...(side === 'server' ? ['server', 'logs', name] : ['logs', name]))
+      try {
+        await access(file)
+      } catch {
+        return { exists: false, content: '' }
+      }
+      const content =
+        side === 'server'
+          ? await services.logs.getServerLogContent(instanceId, name)
+          : await services.logs.getLogContent(instanceId, name)
+      return { exists: true, content }
     },
   }
 }

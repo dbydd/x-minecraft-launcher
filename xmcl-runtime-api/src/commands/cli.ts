@@ -90,9 +90,21 @@ export function parseCli(argv: ReadonlyArray<string>, registry: CommandRegistry)
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i]
     if (!cmd) {
-      if (commandIndex.has(tok)) {
-        cmd = commandIndex.get(tok)!
-        cmdNameTokenIndex = i
+      let matched: { command: AnyCommand; lastIndex: number; words: number } | undefined
+      for (const [name, command] of commandIndex) {
+        const parts = name.split(' ')
+        const exact = tok === name
+        const words = exact || parts.every((part, offset) => argv[i + offset] === part)
+        if (!words) continue
+        const wordCount = exact ? 1 : parts.length
+        if (!matched || wordCount > matched.words) {
+          matched = { command, lastIndex: exact ? i : i + parts.length - 1, words: wordCount }
+        }
+      }
+      if (matched) {
+        cmd = matched.command
+        cmdNameTokenIndex = matched.lastIndex
+        i = matched.lastIndex
         continue
       }
     }

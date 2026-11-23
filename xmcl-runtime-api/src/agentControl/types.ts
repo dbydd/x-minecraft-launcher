@@ -92,12 +92,19 @@ export type SessionPhase =
   | { status: 'paired'; sessionId: SessionId; grant: Grant }
   | { status: 'revoked'; sessionId: SessionId }
 
+export interface TaskError {
+  code: string
+  message: string
+  retryable: boolean
+  hint?: string
+}
+
 export interface TaskView {
   taskId: TaskId
   state: 'running' | 'succeeded' | 'failed' | 'cancelled'
-  /** `requested` while the abort is in flight. `honored` only if the work stopped with no effect. `unsupported` if the effect still landed. */
+  /** `requested` while the abort is in flight. `honored` when the work stopped. `unsupported` if the effect still landed. */
   cancellation: 'none' | 'requested' | 'honored' | 'unsupported'
   effect: 'none' | 'partial' | 'applied' | 'unknown'
   result?: unknown
-  error?: string
+  error?: TaskError
 }

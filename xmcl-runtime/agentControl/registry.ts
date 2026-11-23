@@ -431,33 +431,55 @@ export const agentCommands: readonly AgentCommand[] = [
   },
   {
     name: 'runtime_install',
-    description: 'Install the instance Minecraft runtime. Returns a taskId.',
+    description:
+      'Install the instance Minecraft runtime. side client installs the client version. side server installs the dedicated-server files. Returns a taskId.',
     requiresPair: true,
-    inputSchema: objectSchema(instanceProp, ['instanceId']),
+    inputSchema: objectSchema(
+      { ...instanceProp, side: { type: 'string', enum: ['client', 'server'] } },
+      ['instanceId'],
+    ),
     async run(raw, deps) {
-      const input = instanceInput.safeParse(raw)
+      const input = instanceInput
+        .extend({ side: z.enum(['client', 'server']).optional() })
+        .safeParse(raw)
       if (!input.success)
         return failure(agentError('validation', 'instanceId is required', { retryable: true }))
       const id = asInstanceId(input.data.instanceId)
       const scope = scoped(deps, id)
       if ('code' in scope) return failure(scope)
-      return startTask(deps, (signal) => deps.port.installRuntime(id, signal))
+      return startTask(deps, (signal) =>
+        deps.port.installRuntime(id, signal, input.data.side ?? 'client'),
+      )
     },
   },
   {
     name: 'launch',
     description:
-      'Launch the instance with the launcher-selected account. Returns a taskId. The account token is not returned.',
+      'Launch the instance. Pass user with an existing account id, or side server for a dedicated server. Returns a taskId. The account token is not returned.',
     requiresPair: true,
-    inputSchema: objectSchema(instanceProp, ['instanceId']),
+    inputSchema: objectSchema(
+      {
+        ...instanceProp,
+        side: { type: 'string', enum: ['client', 'server'] },
+        user: stringProp,
+      },
+      ['instanceId'],
+    ),
     async run(raw, deps) {
-      const input = instanceInput.safeParse(raw)
+      const input = instanceInput
+        .extend({
+          side: z.enum(['client', 'server']).optional(),
+          user: z.string().min(1).optional(),
+        })
+        .safeParse(raw)
       if (!input.success)
         return failure(agentError('validation', 'instanceId is required', { retryable: true }))
       const id = asInstanceId(input.data.instanceId)
       const scope = scoped(deps, id)
       if ('code' in scope) return failure(scope)
-      return startTask(deps, (signal) => deps.port.launch(id, signal))
+      return startTask(deps, (signal) =>
+        deps.port.launch(id, signal, { side: input.data.side, user: input.data.user }),
+      )
     },
   },
   {
@@ -504,7 +526,12 @@ export const agentCommands: readonly AgentCommand[] = [
       'Read a bounded tail of one instance log file. This is launcher output, not in-game control.',
     requiresPair: true,
     inputSchema: objectSchema(
-      { ...instanceProp, name: stringProp, tailLines: { type: 'number' } },
+      {
+        ...instanceProp,
+        name: stringProp,
+        tailLines: { type: 'number' },
+        side: { type: 'string', enum: ['client', 'server'] },
+      },
       ['instanceId', 'name'],
     ),
     async run(raw, deps) {
@@ -512,6 +539,7 @@ export const agentCommands: readonly AgentCommand[] = [
         .extend({
           name: z.string().min(1),
           tailLines: z.number().int().positive().max(2000).optional(),
+          side: z.enum(['client', 'server']).optional(),
         })
         .safeParse(raw)
       if (!input.success)
@@ -528,12 +556,23 @@ export const agentCommands: readonly AgentCommand[] = [
       const id = asInstanceId(input.data.instanceId)
       const scope = scoped(deps, id)
       if ('code' in scope) return failure(scope)
-      const content = await deps.port.readLog(id, input.data.name)
+      const log = await deps.port.readLog(id, input.data.name, input.data.side ?? 'client')
+      if (!log.exists) {
+        return success({
+          name: input.data.name,
+          exists: false,
+          lines: [],
+          truncated: false,
+          returned: 0,
+        })
+      }
+      const normalized = log.content.replace(/\r\n/g, '\n')
+      const lines = normalized.length === 0 ? [] : normalized.replace(/\n$/, '').split('\n')
       const tailLines = input.data.tailLines ?? 200
-      const lines = content.split('\n')
       const sliced = lines.slice(-tailLines)
       return success({
         name: input.data.name,
+        exists: true,
         lines: sliced,
         truncated: lines.length > sliced.length,
         returned: sliced.length,
