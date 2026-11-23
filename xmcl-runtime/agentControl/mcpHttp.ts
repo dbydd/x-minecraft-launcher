@@ -1,13 +1,26 @@
 import { randomUUID } from 'node:crypto'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage } from 'node:http'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
+import { z } from 'zod'
 import { agentError, failure } from '@xmcl/runtime-api'
-import { bearerToken, handleMcpMessage, type JsonRpcRequest } from './mcpProtocol'
+import { agentCommands } from './registry'
 import type { AgentControlHost } from './session'
 
 export interface AgentControlEndpoint {
   url: string
   port: number
   close(): Promise<void>
+}
+
+const requestAuth = new AsyncLocalStorage<{ token?: string }>()
+
+function bearer(header: string | string[] | undefined) {
+  const value = Array.isArray(header) ? header[0] : header
+  if (!value?.startsWith('Bearer ')) return undefined
+  return value.slice('Bearer '.length).trim()
 }
 
 function readBody(request: IncomingMessage) {
@@ -19,27 +32,32 @@ function readBody(request: IncomingMessage) {
   })
 }
 
-function send(
-  response: ServerResponse,
-  status: number,
-  body: unknown,
-  headers: Record<string, string> = {},
-) {
-  const payload = body === undefined ? '' : JSON.stringify(body)
-  response.writeHead(status, {
-    'content-type': 'application/json',
-    'cache-control': 'no-store',
-    ...headers,
-    ...(payload ? { 'content-length': Buffer.byteLength(payload) } : {}),
-  })
-  response.end(payload)
+export function createAgentMcpServer(host: AgentControlHost, token?: string) {
+  const server = new McpServer({ name: 'xmcl-agent-control', version: '1' })
+  for (const command of agentCommands) {
+    server.registerTool(
+      command.name,
+      {
+        description: command.description,
+        inputSchema: z.object({}).passthrough(),
+      },
+      async (args) => {
+        const result = await host.call(command.name, args, requestAuth.getStore()?.token ?? token)
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+          structuredContent: result,
+          isError: !result.ok,
+        }
+      },
+    )
+  }
+  return server
 }
 
 /**
- * MCP Streamable HTTP. Single JSON responses are used because this server
- * does not push; clients poll task_status. GET /mcp is 405 for that reason.
- * The listener defaults to loopback. A remote closed client needs a tunnel
- * or other reachable forwarder to this URL.
+ * Official MCP Streamable HTTP transport. JSON responses are enabled because
+ * this server does not push. Host and Origin checks are the SDK's DNS-rebinding
+ * guard. Pairing stays on POST /pair and is not an MCP tool.
  */
 export function startAgentControlHttp(
   host: AgentControlHost,
@@ -49,87 +67,99 @@ export function startAgentControlHttp(
     onSession?: (snapshot: ReturnType<AgentControlHost['exportSnapshot']>) => void | Promise<void>
   } = {},
 ): Promise<AgentControlEndpoint> {
-  const sessions = new Set<string>()
+  const sessions = new Map<string, StreamableHTTPServerTransport>()
+  const hostname = options.host ?? '127.0.0.1'
   const server = createServer(async (request, response) => {
     try {
-      const url = new URL(request.url ?? '/', 'http://127.0.0.1')
+      const url = new URL(request.url ?? '/', `http://${hostname}`)
       if (request.method === 'POST' && url.pathname === '/pair') {
         const body = JSON.parse((await readBody(request)) || '{}') as { code?: string }
         const paired = await host.pair(typeof body.code === 'string' ? body.code : '')
         if (paired.ok) await options.onSession?.(host.exportSnapshot())
-        send(response, paired.ok ? 200 : 401, paired)
+        const payload = JSON.stringify(paired)
+        response.writeHead(paired.ok ? 200 : 401, { 'content-type': 'application/json' })
+        response.end(payload)
         return
       }
       if (url.pathname !== '/mcp') {
-        send(response, 404, failure(agentError('not_found', 'Not found', { retryable: false })))
+        response.writeHead(404, { 'content-type': 'application/json' })
+        response.end(
+          JSON.stringify(failure(agentError('not_found', 'Not found', { retryable: false }))),
+        )
         return
       }
-      if (request.method === 'GET') {
-        send(response, 405, rpcMethod('Server does not push events; poll task_status'))
+      const raw = request.method === 'POST' ? await readBody(request) : undefined
+      const parsed = raw ? JSON.parse(raw || 'null') : undefined
+      const header = request.headers['mcp-session-id']
+      const sessionId = typeof header === 'string' ? header : undefined
+      let transport = sessionId ? sessions.get(sessionId) : undefined
+      if (!transport && request.method === 'POST' && isInitializeRequest(parsed)) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          enableJsonResponse: true,
+          enableDnsRebindingProtection: true,
+          allowedHosts: [`${hostname}:${boundPort()}`, `localhost:${boundPort()}`],
+          allowedOrigins: [`http://${hostname}:${boundPort()}`, `http://localhost:${boundPort()}`],
+          onsessioninitialized: (id) => {
+            if (transport) sessions.set(id, transport)
+          },
+          onsessionclosed: (id) => {
+            sessions.delete(id)
+          },
+        })
+        await createAgentMcpServer(host).connect(transport)
+      }
+      if (!transport) {
+        response.writeHead(sessionId ? 404 : 400, { 'content-type': 'application/json' })
+        response.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: null,
+            error: { code: -32000, message: 'MCP session was not initialized' },
+          }),
+        )
         return
       }
-      if (request.method === 'DELETE') {
-        const id = request.headers['mcp-session-id']
-        if (typeof id === 'string') sessions.delete(id)
-        response.writeHead(204)
-        response.end()
-        return
-      }
-      if (request.method !== 'POST') {
-        send(response, 405, rpcMethod('Method not allowed'))
-        return
-      }
-      const accept = request.headers.accept ?? ''
-      if (!accept.includes('application/json') || !accept.includes('text/event-stream')) {
-        send(response, 406, rpcMethod('Accept must include application/json and text/event-stream'))
-        return
-      }
-      const message = JSON.parse((await readBody(request)) || 'null') as JsonRpcRequest
-      const existing = request.headers['mcp-session-id']
-      let sessionId = typeof existing === 'string' ? existing : undefined
-      if (message.method !== 'initialize') {
-        if (!sessionId || !sessions.has(sessionId)) {
-          send(response, 404, rpcMethod('MCP session was not initialized'))
-          return
-        }
-      }
-      const handled = await handleMcpMessage(
-        host,
-        message,
-        bearerToken(request.headers.authorization),
+      await requestAuth.run({ token: bearer(request.headers.authorization) }, () =>
+        transport.handleRequest(request, response, parsed),
       )
-      if (message.method === 'tools/call') await options.onSession?.(host.exportSnapshot())
-      if (message.method === 'initialize' && handled.status === 200) {
-        sessionId = randomUUID()
-        sessions.add(sessionId)
-      }
-      send(response, handled.status, handled.body, sessionId ? { 'mcp-session-id': sessionId } : {})
+      if (request.method === 'POST' && !isInitializeRequest(parsed))
+        await options.onSession?.(host.exportSnapshot())
     } catch (error) {
-      send(response, 400, {
-        jsonrpc: '2.0',
-        id: null,
-        error: { code: -32700, message: error instanceof Error ? error.message : 'Parse error' },
-      })
+      if (!response.headersSent) {
+        response.writeHead(400, { 'content-type': 'application/json' })
+        response.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32700,
+              message: error instanceof Error ? error.message : 'Parse error',
+            },
+          }),
+        )
+      }
     }
   })
 
-  const hostname = options.host ?? '127.0.0.1'
-  const port = options.port ?? 0
+  function boundPort() {
+    const address = server.address()
+    return typeof address === 'object' && address ? address.port : (options.port ?? 0)
+  }
+
   return new Promise((resolve, reject) => {
     server.once('error', reject)
-    server.listen(port, hostname, () => {
-      const address = server.address()
-      const bound = typeof address === 'object' && address ? address.port : port
+    server.listen(options.port ?? 0, hostname, () => {
+      const port = boundPort()
       resolve({
-        url: `http://${hostname}:${bound}/mcp`,
-        port: bound,
+        url: `http://${hostname}:${port}/mcp`,
+        port,
         close: () =>
-          new Promise((done, fail) => server.close((error) => (error ? fail(error) : done()))),
+          new Promise((done, fail) => {
+            for (const transport of sessions.values()) void transport.close()
+            server.close((error) => (error ? fail(error) : done()))
+          }),
       })
     })
   })
-}
-
-function rpcMethod(message: string) {
-  return { jsonrpc: '2.0', id: null, error: { code: -32600, message } }
 }

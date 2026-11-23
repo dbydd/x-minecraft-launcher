@@ -1,3 +1,5 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,6 +15,7 @@ class FixturePort implements LauncherPort {
   launchDelay = 0
   readonly instances = new Map<string, string>()
   readonly staged = new Map<string, string[]>()
+  readonly stagedBytes = new Map<string, string>()
   readonly processes = new Map<string, Array<{ pid: number; side: string; ready: boolean }>>()
   readonly sentinel = 'sentinel-token'
 
@@ -42,9 +45,10 @@ class FixturePort implements LauncherPort {
     return { id: asInstanceId(path), name: input.name }
   }
 
-  async stageMarket(input: { instanceId: InstanceId }) {
-    const files = ['mods/example.jar']
+  async stageMarket(input: { instanceId: InstanceId; ref: string }) {
+    const files = [`mods/${input.ref.replace(/[^a-z0-9._-]+/gi, '_')}.txt`]
     this.staged.set(input.instanceId, files)
+    this.stagedBytes.set(input.instanceId, `staged:${input.ref}`)
     return { files }
   }
 
@@ -54,11 +58,11 @@ class FixturePort implements LauncherPort {
   }
 
   async applyInstall(instanceId: InstanceId, signal: AbortSignal) {
-    if (signal.aborted) throw new Error('task cancelled')
+    if (signal.aborted) throw Object.assign(new Error('task cancelled'), { code: 'task_cancelled' })
     const files = this.staged.get(instanceId) ?? []
     for (const file of files) {
       await mkdir(join(instanceId, 'mods'), { recursive: true })
-      await writeFile(join(instanceId, file), 'example-mod')
+      await writeFile(join(instanceId, file), this.stagedBytes.get(instanceId) ?? '')
     }
     this.staged.set(instanceId, [])
     return { applied: files.length }
@@ -84,7 +88,7 @@ class FixturePort implements LauncherPort {
         'abort',
         () => {
           clearTimeout(timer)
-          reject(new Error('task cancelled'))
+          reject(Object.assign(new Error('task cancelled'), { code: 'task_cancelled' }))
         },
         { once: true },
       )
@@ -111,11 +115,13 @@ class FixturePort implements LauncherPort {
   }
 }
 
-const accept = 'application/json, text/event-stream'
 let directory = ''
 let endpoint: { url: string; close(): Promise<void> } | undefined
+let client: Client | undefined
 
 afterEach(async () => {
+  await client?.close().catch(() => undefined)
+  client = undefined
   await endpoint?.close()
   endpoint = undefined
   if (directory) await rm(directory, { recursive: true, force: true })
@@ -134,59 +140,38 @@ async function boot() {
   })
   const pairBody = (await paired.json()) as { ok: true; data: { token: string } }
   const token = pairBody.data.token
-  const opened = await rpc(1, 'initialize', {
-    protocolVersion: '2025-03-26',
-    capabilities: {},
-    clientInfo: { name: 'test', version: '0' },
-  })
-  if (!opened.session) throw new Error('MCP session was not created')
-  return { port, token, session: opened.session, pairBody }
-}
-
-async function rpc(id: number, method: string, params: unknown, token?: string, session?: string) {
-  const response = await fetch(endpoint!.url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept,
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-      ...(session ? { 'mcp-session-id': session } : {}),
-    },
-    body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
-  })
-  return {
-    status: response.status,
-    session: response.headers.get('mcp-session-id'),
-    body: (await response.json()) as any,
-  }
+  const origin = new URL(endpoint.url).origin
+  client = new Client({ name: 'xmcl-agent-control-test', version: '0' })
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL(endpoint.url), {
+      requestInit: { headers: { authorization: `Bearer ${token}`, origin } },
+    }),
+  )
+  return { port, token, session: 'sdk', pairBody }
 }
 
 async function tool(
-  token: string,
-  session: string,
+  _token: string,
+  _session: string,
   name: string,
   args: Record<string, unknown> = {},
 ) {
-  const response = await rpc(
-    name.length + argsLength(args),
-    'tools/call',
-    { name, arguments: args },
-    token,
-    session,
-  )
-  const result = response.body.result
-  const structured = result.structuredContent
+  const result = await client!.callTool({ name, arguments: args })
+  const content = Array.isArray(result.content) ? result.content : []
+  const text =
+    content.find((item: { type?: string; text?: string }) => item.type === 'text')?.text ?? ''
+  const structured = (result.structuredContent ?? JSON.parse(text)) as {
+    ok: boolean
+    data?: any
+    error?: any
+  }
   return {
-    isError: result.isError as boolean,
-    text: result.content[0].text as string,
+    isError: Boolean(result.isError),
+    text,
     data: structured.ok ? structured.data : undefined,
     error: structured.ok ? undefined : structured.error,
-    raw: JSON.stringify(response.body),
+    raw: text,
   }
-}
-
-function argsLength(args: Record<string, unknown>) {
-  return JSON.stringify(args).length
 }
 
 async function poll(token: string, session: string, taskId: string) {
@@ -201,8 +186,8 @@ async function poll(token: string, session: string, taskId: string) {
 describe('MCP agent control loop', () => {
   test('a client using only MCP tools customizes files and controls the instance', async () => {
     const { port, token, session } = await boot()
-    const listed = await rpc(2, 'tools/list', {}, token, session)
-    const names = listed.body.result.tools.map((entry: { name: string }) => entry.name)
+    const listed = await client!.listTools()
+    const names = listed.tools.map((entry) => entry.name)
     for (const denied of AGENT_CONTROL_DENYLIST) expect(names).not.toContain(denied)
 
     const created = await tool(token, session, 'instances_create', { name: 'Custom Pack' })
@@ -210,16 +195,17 @@ describe('MCP agent control loop', () => {
     const instanceId = created.data.id as string
     const staged = await tool(token, session, 'install_stage', {
       instanceId,
-      provider: 'modrinth',
-      versionId: 'abc',
+      ref: 'modrinth:sodium@mc1.21.1-0.6.0',
     })
-    expect(staged.data.files).toEqual(['mods/example.jar'])
+    expect(staged.data.files).toEqual(['mods/modrinth_sodium_mc1.21.1-0.6.0.txt'])
     const status = await tool(token, session, 'install_status', { instanceId })
     expect(status.data.pending).toBe(true)
     const apply = await tool(token, session, 'install_apply', { instanceId })
     const applied = await poll(token, session, apply.data.taskId)
     expect(applied.state).toBe('succeeded')
-    expect(await readFile(join(instanceId, 'mods/example.jar'), 'utf8')).toBe('example-mod')
+    expect(
+      await readFile(join(instanceId, 'mods/modrinth_sodium_mc1.21.1-0.6.0.txt'), 'utf8'),
+    ).toBe('staged:modrinth:sodium@mc1.21.1-0.6.0')
 
     const files = [
       ['config/pack.toml', 'name = "pack"\n'],
@@ -289,9 +275,11 @@ describe('MCP agent control loop', () => {
     port.launchDelay = 250
     const cancelling = await tool(token, session, 'launch', { instanceId })
     const cancel = await tool(token, session, 'task_cancel', { taskId: cancelling.data.taskId })
-    expect(cancel.data.state).toBe('cancelled')
+    expect(cancel.data.cancellation).toBe('requested')
     const cancelled = await poll(token, session, cancelling.data.taskId)
     expect(cancelled.state).toBe('cancelled')
+    expect(cancelled.cancellation).toBe('honored')
+    expect(cancelled.effect).toBe('none')
 
     const lines = Array.from({ length: 50 }, (_, index) => `line-${index}`)
     await writeFile(join(instanceId, 'logs', 'latest.log'), lines.join('\n'))
@@ -304,9 +292,10 @@ describe('MCP agent control loop', () => {
     expect(log.data.truncated).toBe(true)
     expect(log.raw.includes(port.sentinel)).toBe(false)
 
-    const denied = await tool(token, session, 'getOfficialUserProfile')
+    const denied = await client!.callTool({ name: 'getOfficialUserProfile', arguments: {} })
     expect(denied.isError).toBe(true)
-    expect(denied.error.code).toBe('denied')
+    expect(JSON.stringify(denied)).toMatch(/not found|denied/i)
+    expect(JSON.stringify(denied)).not.toContain(port.sentinel)
   })
 
   test('symlink follow, path escape, and hardlink overwrite are refused or broken', async () => {
@@ -357,6 +346,32 @@ describe('MCP agent control loop', () => {
     )
   })
 
+  test('a foreign Origin is rejected before initialize', async () => {
+    directory = await mkdtemp(join(tmpdir(), 'xmcl-origin-'))
+    const host = new AgentControlHost(new FixturePort(directory), join(directory, 'changes'))
+    host.issuePairingCode()
+    endpoint = await startAgentControlHttp(host)
+    const response = await fetch(endpoint.url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        origin: 'https://evil.example',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-03-26',
+          capabilities: {},
+          clientInfo: { name: 'x', version: '0' },
+        },
+      }),
+    })
+    expect(response.status).toBe(403)
+  })
+
   test('stdio initialize returns the server info without a push channel', async () => {
     directory = await mkdtemp(join(tmpdir(), 'xmcl-stdio-'))
     const host = new AgentControlHost(new FixturePort(directory), join(directory, 'changes'))
@@ -366,11 +381,20 @@ describe('MCP agent control loop', () => {
     output.on('data', (chunk) => {
       text += chunk.toString()
     })
-    serveAgentControlStdio(host, input, output)
-    const payload = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
-    input.write(`Content-Length: ${Buffer.byteLength(payload)}\r\n\r\n${payload}`)
-    await new Promise((resolve) => setTimeout(resolve, 30))
+    await serveAgentControlStdio(host, input, output)
+    input.write(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-03-26',
+          capabilities: {},
+          clientInfo: { name: 'stdio-test', version: '0' },
+        },
+      })}\n`,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 100))
     expect(text).toContain('xmcl-agent-control')
-    expect(text).toContain('does not push events')
   })
 })

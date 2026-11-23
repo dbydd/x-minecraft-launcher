@@ -15,7 +15,7 @@ Streamable HTTP:
 3. `GET /mcp` returns 405. This server does not push. Poll `task_status`.
 4. `DELETE /mcp` ends the MCP session. It does not revoke the pairing token.
 
-`XMCL_AGENT_CONTROL_STDIO=1` also accepts LSP-style `Content-Length` frames on stdin. Use that only when the client can spawn a process on this computer.
+`XMCL_AGENT_CONTROL_STDIO=1` also speaks the SDK stdio transport, which is one JSON-RPC message per line. Use that only when the client can spawn a process on this computer.
 
 ## Pairing
 
@@ -36,9 +36,9 @@ The grant includes instances that exist at pairing time, permission to create ne
 
 `capabilities`, `instances_list`, `instances_create`, `vfs_list`, `vfs_read`, `vfs_grep`, `vfs_write`, `vfs_rollback`, `install_stage`, `install_status`, `install_apply`, `import_modpack`, `runtime_install`, `launch`, `processes_list`, `process_stop`, `logs_read`, `task_status`, `task_cancel`, `session_revoke`.
 
-`install_apply`, `import_modpack`, `runtime_install`, and `launch` return a `taskId`. Call `task_status` until the state is no longer `running`. `task_cancel` aborts that task's `AbortController`.
+`install_apply`, `import_modpack`, `runtime_install`, and `launch` return a `taskId`. Call `task_status` until `state` is no longer `running`. `task_cancel` sets `cancellation` to `requested`. It becomes `honored` only when the work stops with `effect: none`. If the work still finishes, `cancellation` is `unsupported` and `effect` is `applied`.
 
-`vfs_write` requires `expectedHash` from `vfs_read` for an existing file, or `null` to create one. Use `kind: "replacements"` for exact literal edits or `kind: "content"` for a full rewrite. A mismatch returns `conflict` with `currentHash` and a short snippet. `changeId` is the rollback handle.
+`vfs_write` requires `expectedHash` from `vfs_read` for an existing file, or `null` to create one. `vfs_delete` uses the same hash. Use `kind: "replacements"` for exact literal edits or `kind: "content"` for a full rewrite. A mismatch returns `conflict` with `currentHash` and a short snippet. `changeId` rolls back only while the file still has that write's hash, and only for the instance that owns the change. A second rollback of the same id conflicts. The transport is the official MCP SDK Streamable HTTP server.
 
 JSON is parsed. TOML is parsed with `smol-toml`. KubeJS files are text with a 512 KiB limit. Whether a script runs is visible only in a later bounded `logs_read`, after `launch`.
 

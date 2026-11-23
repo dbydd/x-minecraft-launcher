@@ -1,4 +1,4 @@
-import { MarketType, asInstanceId, type InstallMarketOptionWithInstance } from '@xmcl/runtime-api'
+import { asInstanceId } from '@xmcl/runtime-api'
 import type { LauncherPort } from './port'
 
 export interface XmclControlServices {
@@ -8,9 +8,6 @@ export interface XmclControlServices {
       all: Record<string, { runtime?: object; version?: string }>
     }>
     createInstance(options: { name: string; runtime?: { minecraft?: string } }): Promise<string>
-  }
-  mods: {
-    resolveFromMarket(options: InstallMarketOptionWithInstance): Promise<Array<{ path: string }>>
   }
   install: {
     stageInstanceFiles(options: {
@@ -81,20 +78,13 @@ export function createServiceLauncherPort(services: XmclControlServices): Launch
       return { id: asInstanceId(path), name: input.name }
     },
     async stageMarket(input) {
-      const files =
-        input.provider === 'modrinth'
-          ? await services.mods.resolveFromMarket({
-              market: MarketType.Modrinth,
-              instancePath: input.instanceId,
-              version: { versionId: input.versionId ?? '' },
-            })
-          : await services.mods.resolveFromMarket({
-              market: MarketType.CurseForge,
-              instancePath: input.instanceId,
-              file: { fileId: input.fileId ?? 0 },
-            })
-      await services.install.stageInstanceFiles({ path: input.instanceId, oldFiles: [], files })
-      return { files: files.map((file) => file.path) }
+      await services.commands.dispatch('mod.install', {
+        ref: input.ref,
+        instance: input.instanceId,
+        dependencies: false,
+      })
+      const manifest = await services.install.getInstanceInstallManifest(input.instanceId)
+      return { files: manifest?.files?.map((file) => file.path) ?? [] }
     },
     async installStatus(instanceId) {
       const manifest = await services.install.getInstanceInstallManifest(instanceId)

@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { LauncherAppPlugin } from '~/app'
 import { kCommandHost } from '~/commands/kCommandHost'
 import { VersionInstallService } from '~/install'
-import { InstanceLogService, InstanceModsService, InstanceService } from '~/instance'
+import { InstanceLogService, InstanceService } from '~/instance'
 import { InstanceInstallService } from '~/instanceIO'
 import { LaunchService } from '~/launch'
 import { ModpackService } from '~/modpack'
@@ -18,7 +18,7 @@ import { serveAgentControlStdio } from './stdio'
  */
 export const pluginAgentControl: LauncherAppPlugin = (app) => {
   let close: (() => Promise<void>) | undefined
-  let stopStdio: (() => void) | undefined
+  let stopStdio: (() => Promise<void>) | undefined
   app
     .waitEngineReady()
     .then(async () => {
@@ -26,7 +26,6 @@ export const pluginAgentControl: LauncherAppPlugin = (app) => {
       const directory = join(app.appDataPath, 'agent-control')
       await mkdir(directory, { recursive: true, mode: 0o700 })
       const instances = await app.registry.getOrCreate(InstanceService)
-      const mods = await app.registry.getOrCreate(InstanceModsService)
       const install = await app.registry.getOrCreate(InstanceInstallService)
       const modpack = await app.registry.getOrCreate(ModpackService)
       const versions = await app.registry.getOrCreate(VersionInstallService)
@@ -35,7 +34,6 @@ export const pluginAgentControl: LauncherAppPlugin = (app) => {
       const commands = await app.registry.get(kCommandHost)
       const port = createServiceLauncherPort({
         instances,
-        mods,
         install,
         modpack,
         versions,
@@ -73,7 +71,7 @@ export const pluginAgentControl: LauncherAppPlugin = (app) => {
       await writeFile(endpointPath, endpoint.url, { mode: 0o600 })
       logger.log(`Agent control MCP listening on ${endpoint.url}`)
       if (process.env.XMCL_AGENT_CONTROL_STDIO === '1') {
-        stopStdio = serveAgentControlStdio(host, process.stdin, process.stdout)
+        stopStdio = await serveAgentControlStdio(host, process.stdin, process.stdout)
         logger.log('Agent control stdio transport attached')
       }
     })
@@ -81,7 +79,7 @@ export const pluginAgentControl: LauncherAppPlugin = (app) => {
       app.getLogger('AgentControl').error(error as Error)
     })
   app.registryDisposer(async () => {
-    stopStdio?.()
+    await stopStdio?.()
     await close?.()
   })
 }

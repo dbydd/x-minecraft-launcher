@@ -13,12 +13,7 @@ export interface LauncherPort {
     name: string
     minecraft?: string
   }): Promise<{ id: InstanceId; name: string }>
-  stageMarket(input: {
-    instanceId: InstanceId
-    provider: 'modrinth' | 'curseforge'
-    versionId?: string
-    fileId?: number
-  }): Promise<{ files: string[] }>
+  stageMarket(input: { instanceId: InstanceId; ref: string }): Promise<{ files: string[] }>
   installStatus(
     instanceId: InstanceId,
   ): Promise<{ pending: boolean; files: string[]; oldFiles: string[] }>

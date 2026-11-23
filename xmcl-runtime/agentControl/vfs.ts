@@ -13,6 +13,7 @@ import {
 } from 'node:fs/promises'
 import { dirname, join, sep } from 'node:path'
 import { parse as parseToml } from 'smol-toml'
+import { z } from 'zod'
 import {
   agentError,
   asChangeId,
@@ -48,6 +49,8 @@ export interface ChangeRecord {
   instanceId: InstanceId
   path: VirtualPath
   previous: string | null
+  /** Hash after the write. Null means the write deleted the file. */
+  afterHash: ContentHash | null
   createdAt: number
 }
 
@@ -100,6 +103,14 @@ async function inspectPath(
     const part = parts[index]!
     if ((FORBIDDEN_INSTANCE_SEGMENTS as readonly string[]).includes(part)) {
       return { error: denied(`Path segment '${part}' is a shared launcher directory`) }
+    }
+    if (
+      part.includes(':') ||
+      /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(part) ||
+      part.endsWith('.') ||
+      part.endsWith(' ')
+    ) {
+      return { error: denied(`Path segment '${part}' is not a portable virtual name`) }
     }
     current = join(current, part)
     const last = index === parts.length - 1
@@ -420,7 +431,60 @@ async function collectFiles(instanceRoot: string, relative: string): Promise<str
   return found
 }
 
-export async function writeVirtualFile(
+const pathLocks = new Map<string, Promise<void>>()
+
+function withPathLock<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const previous = pathLocks.get(key) ?? Promise.resolve()
+  const runOnce = previous.catch(() => undefined).then(run)
+  pathLocks.set(
+    key,
+    runOnce.then(
+      () => undefined,
+      () => undefined,
+    ),
+  )
+  return runOnce
+}
+
+async function persistRecord(changesRoot: string, record: ChangeRecord) {
+  await mkdir(changesRoot, { recursive: true })
+  const recordPath = join(changesRoot, `${record.id}.json`)
+  await writeFile(recordPath, JSON.stringify(record), { mode: 0o600, flag: 'wx' })
+  return recordPath
+}
+
+async function commitNewFile(
+  target: string,
+  next: string,
+  record: ChangeRecord,
+  changesRoot: string,
+): Promise<CommandResult<{ hash: ContentHash }>> {
+  const temp = `${target}.${randomUUID()}.tmp`
+  let recordPath: string | undefined
+  try {
+    await writeFile(temp, next, { flag: 'wx' })
+    const handle = await open(temp, 'r+')
+    await handle.sync()
+    await handle.close()
+    recordPath = await persistRecord(changesRoot, record)
+    await rename(temp, target)
+  } catch (error) {
+    await rm(temp, { force: true })
+    if (recordPath) await rm(recordPath, { force: true })
+    return failure(
+      agentError('unavailable', error instanceof Error ? error.message : String(error), {
+        retryable: true,
+      }),
+    )
+  }
+  const written = await readChecked(target)
+  if (!isLoadedFile(written) || written.content !== next) {
+    return failure(agentError('unavailable', 'Write verification failed', { retryable: true }))
+  }
+  return success({ hash: written.hash })
+}
+
+async function writeVirtualFileBody(
   ctx: VfsContext,
   write: VfsWrite,
 ): Promise<
@@ -444,7 +508,6 @@ export async function writeVirtualFile(
 
   let previous: string | null = null
   let currentHash: ContentHash | null = null
-  let nlink = 1
   if (walked.exists) {
     const loaded = await readChecked(walked.target)
     if ('error' in loaded && loaded.error) return failure(loaded.error)
@@ -452,7 +515,6 @@ export async function writeVirtualFile(
       return failure(agentError('unavailable', 'Unable to read file', { retryable: true }))
     previous = loaded.content
     currentHash = loaded.hash
-    nlink = loaded.nlink
     if (write.expectedHash === null) {
       return failure(
         agentError('conflict', 'File already exists', {
@@ -523,68 +585,61 @@ export async function writeVirtualFile(
     )
   }
   const brokeLink = isLoadedFile(latest) && latest.nlink > 1
-  nlink = isLoadedFile(latest) ? latest.nlink : nlink
-
-  const temp = `${walked.target}.${randomUUID()}.tmp`
-  try {
-    await writeFile(temp, next, { flag: 'wx' })
-    const handle = await open(temp, 'r+')
-    await handle.sync()
-    await handle.close()
-    if (walked.exists && nlink > 1) await unlink(walked.target)
-    try {
-      await rename(temp, walked.target)
-    } catch (error) {
-      if (walked.exists && nlink <= 1) {
-        await unlink(walked.target)
-        await rename(temp, walked.target)
-      } else {
-        throw error
-      }
-    }
-  } catch (error) {
-    await rm(temp, { force: true })
-    if (previous !== null) {
-      const still = await lstat(walked.target).catch(() => undefined)
-      if (!still) await writeFile(walked.target, previous, { flag: 'wx' })
-    }
-    return failure(
-      agentError('unavailable', error instanceof Error ? error.message : String(error), {
-        retryable: true,
-      }),
-    )
-  }
-
-  const written = await readChecked(walked.target)
-  if (!('content' in written) || written.content !== next) {
-    return failure(agentError('unavailable', 'Write verification failed', { retryable: true }))
-  }
-  const finalReal = await realpath(walked.target)
-  const instanceReal = await realpath(ctx.instanceRoot)
-  if (!inside(instanceReal, finalReal)) {
-    return failure(denied('Write resolved outside the instance directory'))
-  }
   const changeId = asChangeId(randomUUID())
+  const afterHash = hashText(next)
   const record: ChangeRecord = {
     id: changeId,
     instanceId: ctx.instanceId,
     path: ctx.virtualPath,
     previous,
+    afterHash,
     createdAt: Date.now(),
   }
-  const changeDir = join(ctx.changesRoot, ctx.instanceId.replace(/[^a-zA-Z0-9._-]/g, '_'))
-  await mkdir(changeDir, { recursive: true })
-  await writeFile(join(changeDir, `${changeId}.json`), JSON.stringify(record), { mode: 0o600 })
+  const committed = await commitNewFile(walked.target, next, record, ctx.changesRoot)
+  if (!committed.ok) return committed
+  const finalReal = await realpath(walked.target)
+  const instanceReal = await realpath(ctx.instanceRoot)
+  if (!inside(instanceReal, finalReal)) {
+    return failure(denied('Write resolved outside the instance directory'))
+  }
   return success({
     path: ctx.virtualPath,
     changeId,
-    hash: written.hash,
+    hash: afterHash,
     brokeLink,
     created: previous === null,
   })
 }
 
-export async function rollbackChange(input: {
+export function writeVirtualFile(ctx: VfsContext, write: VfsWrite) {
+  return withPathLock(`${ctx.instanceRoot}\0${ctx.virtualPath}`, () =>
+    writeVirtualFileBody(ctx, write),
+  )
+}
+
+const changeRecordSchema = z.object({
+  id: z.string().uuid(),
+  instanceId: z.string().min(1),
+  path: z.string().min(1),
+  previous: z.string().nullable(),
+  afterHash: z.string().nullable(),
+  createdAt: z.number(),
+})
+
+function postimageConflict(
+  currentHash: ContentHash | null,
+  snippet: string,
+  instanceId: InstanceId,
+  path: VirtualPath,
+) {
+  return agentError('conflict', 'The file no longer matches this change', {
+    ...(currentHash ? { currentHash } : {}),
+    snippet,
+    retry: { tool: 'vfs_read', arguments: { instanceId, path } },
+  })
+}
+
+async function rollbackChangeBody(input: {
   instanceRoot: string
   instanceId: InstanceId
   changeId: ChangeId
@@ -592,52 +647,169 @@ export async function rollbackChange(input: {
   writableRoots: readonly WritableRoot[]
   forbiddenRoots?: readonly string[]
 }): Promise<CommandResult<{ changeId: ChangeId; path: VirtualPath; hash: ContentHash | null }>> {
-  const changeDir = join(input.changesRoot, input.instanceId.replace(/[^a-zA-Z0-9._-]/g, '_'))
-  const recordPath = join(changeDir, `${input.changeId}.json`)
-  const raw = await readFile(recordPath, 'utf8').catch(() => undefined)
+  const raw = await readFile(join(input.changesRoot, `${input.changeId}.json`), 'utf8').catch(
+    () => undefined,
+  )
   if (!raw)
     return failure(
       agentError('not_found', `Change not found: ${input.changeId}`, { retryable: false }),
     )
-  const record = JSON.parse(raw) as ChangeRecord
-  if (record.previous === null) {
-    const target = join(input.instanceRoot, record.path)
-    const stat = await lstat(target).catch(() => undefined)
-    if (stat?.isSymbolicLink()) return failure(denied('Refusing to delete through a symlink'))
-    if (stat) await unlink(target)
-    return success({ changeId: input.changeId, path: record.path, hash: null })
+  let json: unknown
+  try {
+    json = JSON.parse(raw)
+  } catch {
+    return failure(agentError('validation', 'Change record is unreadable', { retryable: false }))
   }
-  const current = await readVirtualFile(
-    {
-      instanceRoot: input.instanceRoot,
-      instanceId: input.instanceId,
-      virtualPath: record.path,
-      writableRoots: input.writableRoots,
-      changesRoot: input.changesRoot,
-      forbiddenRoots: input.forbiddenRoots,
-    },
-    0,
-    MAX_BYTES,
-  )
-  if (!current.ok) return current
-  const restored = await writeVirtualFile(
-    {
-      instanceRoot: input.instanceRoot,
-      instanceId: input.instanceId,
-      virtualPath: record.path,
-      writableRoots: input.writableRoots,
-      changesRoot: input.changesRoot,
-      forbiddenRoots: input.forbiddenRoots,
-    },
-    {
+  const parsed = changeRecordSchema.safeParse(json)
+  if (!parsed.success)
+    return failure(agentError('validation', 'Change record is unreadable', { retryable: false }))
+  if (parsed.data.instanceId !== input.instanceId)
+    return failure(denied('Change belongs to a different instance'))
+  const path = parsed.data.path as VirtualPath
+  if (!rootAllowed(path, input.writableRoots))
+    return failure(denied('Change path is outside the granted roots'))
+  const base = {
+    instanceRoot: input.instanceRoot,
+    instanceId: input.instanceId,
+    virtualPath: path,
+    writableRoots: input.writableRoots,
+    changesRoot: input.changesRoot,
+    forbiddenRoots: input.forbiddenRoots,
+  }
+  if (parsed.data.afterHash === null) {
+    const present = await inspectPath(input.instanceRoot, path, 'read')
+    if (!('error' in present) || !present.error)
+      return failure(postimageConflict(null, 'file still exists', input.instanceId, path))
+    if (present.error.code !== 'not_found') return failure(present.error)
+    if (parsed.data.previous === null)
+      return failure(
+        agentError('validation', 'Change has no bytes to restore', { retryable: false }),
+      )
+    const restored = await writeVirtualFileBody(base, {
       kind: 'content',
-      expectedHash: current.data.hash,
-      content: record.previous,
+      expectedHash: null,
+      content: parsed.data.previous,
       validate: 'none',
-    },
-  )
+    })
+    if (!restored.ok) return restored
+    return success({ changeId: input.changeId, path, hash: restored.data.hash })
+  }
+  const walked = await inspectPath(input.instanceRoot, path, 'read')
+  if ('error' in walked) {
+    if (!walked.error)
+      return failure(agentError('unavailable', 'Unable to resolve path', { retryable: true }))
+    return failure(
+      walked.error.code === 'not_found'
+        ? postimageConflict(null, 'file is gone', input.instanceId, path)
+        : walked.error,
+    )
+  }
+  const guard = await guardParent(input.instanceRoot, walked.parent, input.forbiddenRoots ?? [])
+  if (guard) return failure(guard)
+  const loaded = await readChecked(walked.target)
+  if (!isLoadedFile(loaded))
+    return failure(
+      'error' in loaded
+        ? loaded.error
+        : agentError('unavailable', 'Unable to read file', { retryable: true }),
+    )
+  if (loaded.hash !== parsed.data.afterHash)
+    return failure(
+      postimageConflict(loaded.hash, loaded.content.slice(0, SNIPPET), input.instanceId, path),
+    )
+  if (parsed.data.previous === null) {
+    await unlink(walked.target)
+    return success({ changeId: input.changeId, path, hash: null })
+  }
+  const restored = await writeVirtualFileBody(base, {
+    kind: 'content',
+    expectedHash: loaded.hash as ContentHash,
+    content: parsed.data.previous,
+    validate: 'none',
+  })
   if (!restored.ok) return restored
-  return success({ changeId: restored.data.changeId, path: record.path, hash: restored.data.hash })
+  return success({ changeId: input.changeId, path, hash: restored.data.hash })
+}
+
+export function rollbackChange(input: {
+  instanceRoot: string
+  instanceId: InstanceId
+  changeId: ChangeId
+  changesRoot: string
+  writableRoots: readonly WritableRoot[]
+  forbiddenRoots?: readonly string[]
+}) {
+  return withPathLock(`change:${input.changeId}`, async () => {
+    const peek = await readFile(join(input.changesRoot, `${input.changeId}.json`), 'utf8').catch(
+      () => undefined,
+    )
+    let path: string | undefined
+    try {
+      path = peek ? (JSON.parse(peek) as { path?: string }).path : undefined
+    } catch {
+      path = undefined
+    }
+    if (!path) return rollbackChangeBody(input)
+    return withPathLock(`${input.instanceRoot}\0${path}`, () => rollbackChangeBody(input))
+  })
+}
+
+export function deleteVirtualFile(
+  ctx: VfsContext,
+  expectedHash: ContentHash,
+): Promise<CommandResult<{ path: VirtualPath; changeId: ChangeId }>> {
+  return withPathLock(`${ctx.instanceRoot}\0${ctx.virtualPath}`, async () => {
+    if (!rootAllowed(ctx.virtualPath, ctx.writableRoots))
+      return failure(denied(`Path is outside the granted writable roots: ${ctx.virtualPath}`))
+    const walked = await inspectPath(ctx.instanceRoot, ctx.virtualPath, 'read')
+    if ('error' in walked && walked.error) return failure(walked.error)
+    if (!('target' in walked))
+      return failure(
+        agentError('not_found', `File not found: ${ctx.virtualPath}`, { retryable: false }),
+      )
+    const guard = await guardParent(ctx.instanceRoot, walked.parent, ctx.forbiddenRoots ?? [])
+    if (guard) return failure(guard)
+    const loaded = await readChecked(walked.target)
+    if (!isLoadedFile(loaded))
+      return failure(
+        'error' in loaded
+          ? loaded.error
+          : agentError('unavailable', 'Unable to read file', { retryable: true }),
+      )
+    if (loaded.hash !== expectedHash) {
+      return failure(
+        agentError('conflict', 'expectedHash does not match the current file', {
+          currentHash: loaded.hash,
+          snippet: loaded.content.slice(0, SNIPPET),
+          retry: {
+            tool: 'vfs_read',
+            arguments: { instanceId: ctx.instanceId, path: ctx.virtualPath },
+          },
+        }),
+      )
+    }
+    const changeId = asChangeId(randomUUID())
+    let recordPath: string | undefined
+    try {
+      recordPath = await persistRecord(ctx.changesRoot, {
+        id: changeId,
+        instanceId: ctx.instanceId,
+        path: ctx.virtualPath,
+        previous: loaded.content,
+        afterHash: null,
+        createdAt: Date.now(),
+      })
+      await unlink(walked.target)
+    } catch (error) {
+      if (recordPath) await rm(recordPath, { force: true })
+      return failure(
+        agentError('unavailable', error instanceof Error ? error.message : String(error), {
+          retryable: true,
+        }),
+      )
+    }
+    return success({ path: ctx.virtualPath, changeId })
+  })
 }
 
 export { hashText }

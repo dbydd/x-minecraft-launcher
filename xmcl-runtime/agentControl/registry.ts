@@ -10,6 +10,7 @@ import {
   type TaskId,
   type WritableRoot,
   asChangeId,
+  asContentHash,
   asInstanceId,
   asTaskId,
 } from '@xmcl/runtime-api'
@@ -20,6 +21,7 @@ import {
   grepVirtualFiles,
   listVirtualDirectory,
   readVirtualFile,
+  deleteVirtualFile,
   rollbackChange,
   writeVirtualFile,
 } from './vfs'
@@ -316,44 +318,61 @@ export const agentCommands: readonly AgentCommand[] = [
     },
   },
   {
-    name: 'install_stage',
-    description:
-      'Resolve one Modrinth version or CurseForge file into the instance install manifest without copying it yet.',
+    name: 'vfs_delete',
+    description: 'Delete one text file inside a granted root when expectedHash still matches.',
     requiresPair: true,
-    inputSchema: objectSchema(
-      {
-        ...instanceProp,
-        provider: { enum: ['modrinth', 'curseforge'] },
-        versionId: stringProp,
-        fileId: { type: 'number' },
-      },
-      ['instanceId', 'provider'],
-    ),
+    inputSchema: objectSchema({ ...instanceProp, path: stringProp, expectedHash: stringProp }, [
+      'instanceId',
+      'path',
+      'expectedHash',
+    ]),
     async run(raw, deps) {
+      const blocked = unsafePath(raw)
+      if (blocked) return failure(blocked)
       const input = instanceInput
-        .extend({
-          provider: z.enum(['modrinth', 'curseforge']),
-          versionId: z.string().min(1).optional(),
-          fileId: z.number().int().positive().optional(),
-        })
+        .extend({ path: z.string(), expectedHash: z.string() })
         .safeParse(raw)
       if (!input.success)
-        return failure(agentError('validation', 'Invalid install_stage input', { retryable: true }))
-      if (input.data.provider === 'modrinth' && !input.data.versionId)
+        return failure(agentError('validation', 'Invalid vfs_delete input', { retryable: true }))
+      const path = VirtualPathSchema.safeParse(input.data.path)
+      if (!path.success)
+        return failure(agentError('denied', 'Invalid virtual path', { retryable: false }))
+      const scope = scoped(deps, asInstanceId(input.data.instanceId))
+      if ('code' in scope) return failure(scope)
+      return deleteVirtualFile(
+        {
+          instanceRoot: scope.root,
+          instanceId: asInstanceId(input.data.instanceId),
+          virtualPath: path.data,
+          writableRoots: scope.roots,
+          changesRoot: deps.changesRoot,
+        },
+        asContentHash(input.data.expectedHash),
+      )
+    },
+  },
+  {
+    name: 'install_stage',
+    description:
+      'Stage one market ref through the launcher mod.install command. Nothing is copied until install_apply.',
+    requiresPair: true,
+    inputSchema: objectSchema({ ...instanceProp, ref: stringProp }, ['instanceId', 'ref']),
+    async run(raw, deps) {
+      const input = instanceInput.extend({ ref: z.string().min(1) }).safeParse(raw)
+      if (!input.success)
         return failure(
-          agentError('validation', 'modrinth stage requires versionId', { retryable: true }),
-        )
-      if (input.data.provider === 'curseforge' && !input.data.fileId)
-        return failure(
-          agentError('validation', 'curseforge stage requires fileId', { retryable: true }),
+          agentError('validation', 'install_stage requires instanceId and ref', {
+            retryable: true,
+          }),
         )
       const scope = scoped(deps, asInstanceId(input.data.instanceId))
       if ('code' in scope) return failure(scope)
-      const staged = await deps.port.stageMarket({
-        ...input.data,
-        instanceId: asInstanceId(input.data.instanceId),
-      })
-      return success(staged)
+      return success(
+        await deps.port.stageMarket({
+          instanceId: asInstanceId(input.data.instanceId),
+          ref: input.data.ref,
+        }),
+      )
     },
   },
   {
