@@ -373,4 +373,42 @@ describe('agent control vfs', () => {
       await rm(cache, { recursive: true, force: true })
     }
   })
+
+  test('rollback refuses a forged record aimed at a shared runtime directory', async () => {
+    const instance = await setup()
+    const changes = join(instance, '.changes')
+    await mkdir(changes, { recursive: true })
+    const changeId = '11111111-1111-4111-8111-111111111111'
+    await writeFile(join(changes, `${changeId}.json`), JSON.stringify({
+      id: changeId,
+      instanceId: instance,
+      path: 'libraries/evil.jar',
+      previous: null,
+      afterHash: null,
+      createdAt: Date.now(),
+    }))
+    const result = await rollbackChange({
+      instanceRoot: instance,
+      instanceId: asInstanceId(instance),
+      changeId: asChangeId(changeId),
+      changesRoot: changes,
+      writableRoots: ['libraries', ...roots].map(asWritableRoot),
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error.code).toBe('denied')
+    expect(await readFile(join(instance, 'libraries', 'evil.jar')).catch(() => '')).toBe('')
+  })
+
+  test('grep stops after the scan budget', async () => {
+    const instance = await setup()
+    await mkdir(join(instance, 'config', 'many'), { recursive: true })
+    for (let index = 0; index < 220; index++) {
+      await writeFile(join(instance, 'config', 'many', `${index}.txt`), `n=${index}\n`)
+    }
+    const found = await grepVirtualFiles({ instanceRoot: instance, roots, pattern: '^n=', path: asVirtualPath('config/many') })
+    expect(found.ok).toBe(true)
+    if (!found.ok) return
+    expect(found.data.truncatedScan).toBe(true)
+    expect(found.data.matches.length).toBeLessThan(220)
+  })
 })

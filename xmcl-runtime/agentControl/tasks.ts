@@ -20,6 +20,13 @@ function cancelledError(error: unknown) {
   )
 }
 
+function reportedEffect(error: unknown): TaskView['effect'] {
+  if (!error || typeof error !== 'object' || !('effect' in error)) return 'unknown'
+  const effect = (error as { effect?: string }).effect
+  if (effect === 'none' || effect === 'partial' || effect === 'unknown') return effect
+  return 'unknown'
+}
+
 /**
  * Cancel requests the AbortSignal. The task stays `running` with
  * `cancellation: requested` until the work settles. A result means the effect
@@ -50,7 +57,7 @@ export class TaskBook {
         if (cancelledError(error)) {
           record.state = 'cancelled'
           record.cancellation = 'honored'
-          record.effect = 'none'
+          record.effect = reportedEffect(error)
           record.error = error instanceof Error ? error.message : String(error)
           return
         }

@@ -97,7 +97,7 @@ export interface TaskView {
   state: 'running' | 'succeeded' | 'failed' | 'cancelled'
   /** `requested` while the abort is in flight. `honored` only if the work stopped with no effect. `unsupported` if the effect still landed. */
   cancellation: 'none' | 'requested' | 'honored' | 'unsupported'
-  effect: 'none' | 'applied' | 'unknown'
+  effect: 'none' | 'partial' | 'applied' | 'unknown'
   result?: unknown
   error?: string
 }

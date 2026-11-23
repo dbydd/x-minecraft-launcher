@@ -13,6 +13,7 @@ import { serveAgentControlStdio } from './stdio'
 
 class FixturePort implements LauncherPort {
   launchDelay = 0
+  holdRuntime = false
   readonly instances = new Map<string, string>()
   readonly staged = new Map<string, string[]>()
   readonly stagedBytes = new Map<string, string>()
@@ -58,7 +59,7 @@ class FixturePort implements LauncherPort {
   }
 
   async applyInstall(instanceId: InstanceId, signal: AbortSignal) {
-    if (signal.aborted) throw Object.assign(new Error('task cancelled'), { code: 'task_cancelled' })
+    if (signal.aborted) throw Object.assign(new Error('task cancelled'), { code: 'task_cancelled', effect: 'none' })
     const files = this.staged.get(instanceId) ?? []
     for (const file of files) {
       await mkdir(join(instanceId, 'mods'), { recursive: true })
@@ -77,6 +78,26 @@ class FixturePort implements LauncherPort {
 
   async installRuntime(instanceId: InstanceId, signal: AbortSignal) {
     if (signal.aborted) throw new Error('task cancelled')
+    if (this.holdRuntime) {
+      const partial = join(instanceId, 'partial-download.txt')
+      await writeFile(partial, 'partial')
+      const cancelled = Object.assign(new Error('task cancelled'), {
+        code: 'task_cancelled',
+        effect: 'partial',
+      })
+      if (signal.aborted) throw cancelled
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 2000)
+        signal.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer)
+            reject(cancelled)
+          },
+          { once: true },
+        )
+      })
+    }
     await writeFile(join(instanceId, 'runtime.txt'), '1.21.1')
     return { version: '1.21.1' }
   }
@@ -88,7 +109,7 @@ class FixturePort implements LauncherPort {
         'abort',
         () => {
           clearTimeout(timer)
-          reject(Object.assign(new Error('task cancelled'), { code: 'task_cancelled' }))
+          reject(Object.assign(new Error('task cancelled'), { code: 'task_cancelled', effect: 'none' }))
         },
         { once: true },
       )
@@ -147,7 +168,7 @@ async function boot() {
       requestInit: { headers: { authorization: `Bearer ${token}`, origin } },
     }),
   )
-  return { port, token, session: 'sdk', pairBody }
+  return { port, token, session: 'sdk', pairBody, host }
 }
 
 async function tool(
@@ -344,6 +365,29 @@ describe('MCP agent control loop', () => {
     expect(await readFile(join(instanceId, 'config', 'shared.toml'), 'utf8')).toBe(
       'cached = false\n',
     )
+  })
+
+  test('revoking the session aborts in-flight work and leaves its partial file', async () => {
+    const { port, token, session, host } = await boot()
+    port.holdRuntime = true
+    const created = await tool(token, session, 'instances_create', { name: 'Revoke' })
+    const instanceId = created.data.id as string
+    const runtime = await tool(token, session, 'runtime_install', { instanceId })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    const revoked = await tool(token, session, 'session_revoke', {})
+    expect(revoked.isError).toBe(false)
+    let done = host.tasks.poll(runtime.data.taskId)
+    for (let attempt = 0; attempt < 40 && done?.state === 'running'; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 15))
+      done = host.tasks.poll(runtime.data.taskId)
+    }
+    expect(done?.state).toBe('cancelled')
+    expect(done?.cancellation).toBe('honored')
+    expect(done?.effect).toBe('partial')
+    expect(await readFile(join(instanceId, 'partial-download.txt'), 'utf8')).toBe('partial')
+    const again = await tool(token, session, 'instances_list', {})
+    expect(again.isError).toBe(true)
+    expect(again.error.code).toBe('denied')
   })
 
   test('a foreign Origin is rejected before initialize', async () => {

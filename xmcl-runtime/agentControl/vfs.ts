@@ -42,6 +42,7 @@ export interface VfsContext {
   writableRoots: readonly WritableRoot[]
   changesRoot: string
   forbiddenRoots?: readonly string[]
+  signal?: AbortSignal
 }
 
 export interface ChangeRecord {
@@ -367,6 +368,7 @@ export async function grepVirtualFiles(input: {
     offset: number
     limit: number
     hasMore: boolean
+    truncatedScan: boolean
   }>
 > {
   if (!input.pattern || input.pattern.length > 200)
@@ -389,8 +391,9 @@ export async function grepVirtualFiles(input: {
   const limit = Math.min(input.limit ?? 50, 200)
   let seen = 0
   const roots = scope ? [scope] : [...input.roots]
+  const budget = { left: MAX_SCAN_FILES, truncated: false }
   for (const root of roots) {
-    const files = await collectFiles(input.instanceRoot, root)
+    const files = await collectFiles(input.instanceRoot, root, budget)
     for (const file of files) {
       const loaded = await readChecked(join(input.instanceRoot, file)).catch(() => undefined)
       if (!isLoadedFile(loaded)) continue
@@ -407,26 +410,43 @@ export async function grepVirtualFiles(input: {
           })
         }
         seen++
-        if (seen > offset + limit) return success({ matches, offset, limit, hasMore: true })
+        if (seen > offset + limit) return success({ matches, offset, limit, hasMore: true, truncatedScan: budget.truncated })
       }
     }
   }
-  return success({ matches, offset, limit, hasMore: false })
+  return success({ matches, offset, limit, hasMore: false, truncatedScan: budget.truncated })
 }
 
-async function collectFiles(instanceRoot: string, relative: string): Promise<string[]> {
+const MAX_SCAN_FILES = 200
+const MAX_SCAN_DEPTH = 8
+
+async function collectFiles(instanceRoot: string, relative: string, budget: { left: number; truncated: boolean }, depth = 0): Promise<string[]> {
+  if (depth > MAX_SCAN_DEPTH || budget.left <= 0) {
+    budget.truncated = true
+    return []
+  }
   const target = join(instanceRoot, relative)
   const stat = await lstat(target).catch(() => undefined)
   if (!stat || stat.isSymbolicLink()) return []
-  if (stat.isFile()) return [relative]
+  if (stat.isFile()) {
+    budget.left -= 1
+    return [relative]
+  }
   if (!stat.isDirectory()) return []
   const found: string[] = []
   const entries = await readdir(target, { withFileTypes: true })
   for (const entry of entries) {
+    if (budget.left <= 0) {
+      budget.truncated = true
+      break
+    }
     if (entry.isSymbolicLink()) continue
     const child = relative ? `${relative}/${entry.name}` : entry.name
-    if (entry.isDirectory()) found.push(...(await collectFiles(instanceRoot, child)))
-    else if (entry.isFile()) found.push(child)
+    if (entry.isDirectory()) found.push(...(await collectFiles(instanceRoot, child, budget, depth + 1)))
+    else if (entry.isFile()) {
+      budget.left -= 1
+      found.push(child)
+    }
   }
   return found
 }
@@ -458,6 +478,7 @@ async function commitNewFile(
   next: string,
   record: ChangeRecord,
   changesRoot: string,
+  signal?: AbortSignal,
 ): Promise<CommandResult<{ hash: ContentHash }>> {
   const temp = `${target}.${randomUUID()}.tmp`
   let recordPath: string | undefined
@@ -467,6 +488,11 @@ async function commitNewFile(
     await handle.sync()
     await handle.close()
     recordPath = await persistRecord(changesRoot, record)
+    if (signal?.aborted) {
+      await rm(temp, { force: true })
+      await rm(recordPath, { force: true })
+      return failure(denied('Session was revoked before the write was committed'))
+    }
     await rename(temp, target)
   } catch (error) {
     await rm(temp, { force: true })
@@ -496,6 +522,7 @@ async function writeVirtualFileBody(
     created: boolean
   }>
 > {
+  if (ctx.signal?.aborted) return failure(denied('Session was revoked'))
   if (!rootAllowed(ctx.virtualPath, ctx.writableRoots))
     return failure(denied(`Path is outside the granted writable roots: ${ctx.virtualPath}`))
   if (ctx.virtualPath.split('/').includes('.agent-control'))
@@ -595,7 +622,7 @@ async function writeVirtualFileBody(
     afterHash,
     createdAt: Date.now(),
   }
-  const committed = await commitNewFile(walked.target, next, record, ctx.changesRoot)
+  const committed = await commitNewFile(walked.target, next, record, ctx.changesRoot, ctx.signal)
   if (!committed.ok) return committed
   const finalReal = await realpath(walked.target)
   const instanceReal = await realpath(ctx.instanceRoot)
@@ -666,6 +693,9 @@ async function rollbackChangeBody(input: {
   if (parsed.data.instanceId !== input.instanceId)
     return failure(denied('Change belongs to a different instance'))
   const path = parsed.data.path as VirtualPath
+  if (path.split('/').some((part) => part === '.changes' || part === '.agent-control' || (FORBIDDEN_INSTANCE_SEGMENTS as readonly string[]).includes(part))) {
+    return failure(denied('Change path is protected'))
+  }
   if (!rootAllowed(path, input.writableRoots))
     return failure(denied('Change path is outside the granted roots'))
   const base = {
@@ -759,6 +789,7 @@ export function deleteVirtualFile(
   expectedHash: ContentHash,
 ): Promise<CommandResult<{ path: VirtualPath; changeId: ChangeId }>> {
   return withPathLock(`${ctx.instanceRoot}\0${ctx.virtualPath}`, async () => {
+    if (ctx.signal?.aborted) return failure(denied('Session was revoked'))
     if (!rootAllowed(ctx.virtualPath, ctx.writableRoots))
       return failure(denied(`Path is outside the granted writable roots: ${ctx.virtualPath}`))
     const walked = await inspectPath(ctx.instanceRoot, ctx.virtualPath, 'read')
@@ -799,6 +830,10 @@ export function deleteVirtualFile(
         afterHash: null,
         createdAt: Date.now(),
       })
+      if (ctx.signal?.aborted) {
+        await rm(recordPath, { force: true })
+        return failure(denied('Session was revoked before the delete was committed'))
+      }
       await unlink(walked.target)
     } catch (error) {
       if (recordPath) await rm(recordPath, { force: true })

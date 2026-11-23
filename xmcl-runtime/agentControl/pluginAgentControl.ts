@@ -25,6 +25,7 @@ export const pluginAgentControl: LauncherAppPlugin = (app) => {
       const logger = app.getLogger('AgentControl')
       const directory = join(app.appDataPath, 'agent-control')
       await mkdir(directory, { recursive: true, mode: 0o700 })
+      logger.log('Agent control is waiting for the game data path and launcher services')
       const instances = await app.registry.getOrCreate(InstanceService)
       const install = await app.registry.getOrCreate(InstanceInstallService)
       const modpack = await app.registry.getOrCreate(ModpackService)

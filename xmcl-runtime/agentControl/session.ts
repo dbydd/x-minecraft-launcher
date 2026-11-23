@@ -51,6 +51,7 @@ export class AgentControlHost {
   private codeExpires = 0
   private tokenHash = ''
   private preset: PairingOptions = {}
+  private sessionAbort = new AbortController()
   readonly tasks = new TaskBook()
 
   constructor(
@@ -112,6 +113,7 @@ export class AgentControlHost {
   }
 
   revoke() {
+    this.sessionAbort.abort()
     const sessionId =
       this.phase.status === 'paired' || this.phase.status === 'revoked'
         ? this.phase.sessionId
@@ -158,6 +160,7 @@ export class AgentControlHost {
       grant: phase.status === 'paired' ? phase.grant : undefined,
       changesRoot: this.changesRoot,
       tasks: this.tasks,
+      signal: this.sessionAbort.signal,
       rememberInstance: (id: InstanceId) => {
         if (this.phase.status !== 'paired') return
         if (!this.phase.grant.instanceIds.includes(id)) this.phase.grant.instanceIds.push(id)

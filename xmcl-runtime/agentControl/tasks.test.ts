@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, test } from 'vitest'
 import { TaskBook } from './tasks'
 
@@ -11,7 +14,7 @@ describe('task cancellation', () => {
       await new Promise((resolve, reject) => {
         signal.addEventListener(
           'abort',
-          () => reject(Object.assign(new Error('task cancelled'), { code: 'task_cancelled' })),
+          () => reject(Object.assign(new Error('task cancelled'), { code: 'task_cancelled', effect: 'none' })),
           { once: true },
         )
         setTimeout(resolve, 200)
@@ -43,5 +46,31 @@ describe('task cancellation', () => {
     expect(done?.cancellation).toBe('unsupported')
     expect(done?.effect).toBe('applied')
     expect(done?.result).toEqual({ applied: true })
+  })
+
+  test('a cancel after a partial write leaves the file and reports a partial effect', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'xmcl-partial-'))
+    const file = join(directory, 'partial.bin')
+    const book = new TaskBook()
+    const id = book.start(async (signal) => {
+      const { writeFile } = await import('node:fs/promises')
+      await writeFile(file, 'partial-bytes')
+      await new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          reject(Object.assign(new Error('task cancelled'), { code: 'task_cancelled', effect: 'partial' }))
+        }, { once: true })
+      })
+      await writeFile(file, 'complete-bytes')
+      return { wrote: true }
+    })
+    await wait(20)
+    book.cancel(id)
+    await wait(20)
+    const done = book.poll(id)
+    expect(done?.state).toBe('cancelled')
+    expect(done?.cancellation).toBe('honored')
+    expect(done?.effect).toBe('partial')
+    expect(await readFile(file, 'utf8')).toBe('partial-bytes')
+    await rm(directory, { recursive: true, force: true })
   })
 })

@@ -34,6 +34,7 @@ export interface ControlDeps {
   grant: Grant | undefined
   changesRoot: string
   tasks: TaskBook
+  signal: AbortSignal
   rememberInstance(id: InstanceId): void
 }
 
@@ -80,7 +81,9 @@ function startTask(
   deps: ControlDeps,
   work: (signal: AbortSignal) => Promise<unknown>,
 ): CommandResult<{ taskId: TaskId }> {
-  return success({ taskId: deps.tasks.start(work) })
+  return success({
+    taskId: deps.tasks.start((signal) => work(AbortSignal.any([signal, deps.signal]))),
+  })
 }
 
 export const agentCommands: readonly AgentCommand[] = [
@@ -289,6 +292,7 @@ export const agentCommands: readonly AgentCommand[] = [
           virtualPath: path,
           writableRoots: scope.roots,
           changesRoot: deps.changesRoot,
+          signal: deps.signal,
         },
         write,
       )
@@ -346,6 +350,7 @@ export const agentCommands: readonly AgentCommand[] = [
           virtualPath: path.data,
           writableRoots: scope.roots,
           changesRoot: deps.changesRoot,
+          signal: deps.signal,
         },
         asContentHash(input.data.expectedHash),
       )
