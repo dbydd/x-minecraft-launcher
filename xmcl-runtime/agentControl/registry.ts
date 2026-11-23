@@ -121,10 +121,17 @@ export const agentCommands: readonly AgentCommand[] = [
     name: 'instances_create',
     description: 'Create a managed instance and add it to this session scope.',
     requiresPair: true,
-    inputSchema: objectSchema({ name: stringProp, minecraft: stringProp }, ['name']),
+    inputSchema: objectSchema(
+      { name: stringProp, minecraft: stringProp, fabricLoader: stringProp },
+      ['name'],
+    ),
     async run(raw, deps) {
       const input = z
-        .object({ name: z.string().min(1), minecraft: z.string().min(1).optional() })
+        .object({
+          name: z.string().min(1),
+          minecraft: z.string().min(1).optional(),
+          fabricLoader: z.string().min(1).optional(),
+        })
         .safeParse(raw)
       if (!input.success)
         return failure(agentError('validation', 'name is required', { retryable: true }))

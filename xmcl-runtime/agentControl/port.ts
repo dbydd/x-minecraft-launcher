@@ -12,6 +12,7 @@ export interface LauncherPort {
   createInstance(input: {
     name: string
     minecraft?: string
+    fabricLoader?: string
   }): Promise<{ id: InstanceId; name: string }>
   stageMarket(input: { instanceId: InstanceId; ref: string }): Promise<{ files: string[] }>
   installStatus(

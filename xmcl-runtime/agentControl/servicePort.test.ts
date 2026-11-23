@@ -18,8 +18,8 @@ describe('service launcher port', () => {
             all: { '/inst': { runtime: { minecraft: '1.21.1' }, version: '1.21.1' } },
           }
         },
-        async createInstance() {
-          calls.push('create')
+        async createInstance(options) {
+          calls.push(JSON.stringify({ create: options }))
           return '/inst'
         },
       },
@@ -94,6 +94,8 @@ describe('service launcher port', () => {
     )
     const server = await port.installRuntime(asInstanceId('/inst'), new AbortController().signal, 'server')
     expect(server).toEqual({ version: '1.21.1', side: 'server' })
+    await port.createInstance({ name: 'Fabric', minecraft: '1.20.1', fabricLoader: '0.20.1' })
+    expect(calls.some((call) => call.includes('"fabricLoader":"0.20.1"'))).toBe(true)
     await port.stopProcess(asInstanceId('/inst'), 7)
     expect(calls).toContain('kill')
     const source = await readFile(new URL('./servicePort.ts', import.meta.url), 'utf8')

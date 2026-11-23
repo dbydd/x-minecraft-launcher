@@ -84,9 +84,12 @@ export function createServiceLauncherPort(services: XmclControlServices): Launch
       return id
     },
     async createInstance(input) {
+      const runtime = input.minecraft
+        ? { minecraft: input.minecraft, ...(input.fabricLoader ? { fabricLoader: input.fabricLoader } : {}) }
+        : undefined
       const path = await services.instances.createInstance({
         name: input.name,
-        runtime: input.minecraft ? { minecraft: input.minecraft } : undefined,
+        runtime,
       })
       return { id: asInstanceId(path), name: input.name }
     },
