@@ -1,6 +1,7 @@
 import { access } from 'node:fs/promises'
 import { join } from 'node:path'
 import { asInstanceId } from '@xmcl/runtime-api'
+import { curseforgePlan, type DependencyPlan } from './dependencies'
 import type { LauncherPort } from './port'
 
 export interface XmclControlServices {
@@ -51,6 +52,34 @@ export interface XmclControlServices {
       opts?: { signal?: AbortSignal; mode?: 'cli' },
     ): Promise<unknown>
   }
+  dependencies?: {
+    plan(input: {
+      instanceId: string
+      ref: string
+      includeOptional?: string[]
+      signal?: AbortSignal
+    }): Promise<DependencyPlan>
+  }
+}
+
+function uninspectedPlan(ref: string): DependencyPlan {
+  if (ref.startsWith('curseforge:')) return curseforgePlan('', [])
+  return {
+    provider: ref.startsWith('modrinth:') ? 'modrinth' : 'other',
+    context: { minecraft: '', loaders: [] },
+    root: null,
+    dependencies: [],
+    blocked: [
+      {
+        code: 'unresolved',
+        message:
+          'Dependency metadata was not queried. An empty dependency list would mean the provider was not asked, not that the mod has no dependencies.',
+      },
+    ],
+    truncated: false,
+    limitation: 'No market metadata client is configured for this process.',
+    install: [],
+  }
 }
 
 function cancelled() {
@@ -93,14 +122,31 @@ export function createServiceLauncherPort(services: XmclControlServices): Launch
       })
       return { id: asInstanceId(path), name: input.name }
     },
+    async planMarket(input) {
+      if (!services.dependencies) return uninspectedPlan(input.ref)
+      return services.dependencies.plan(input)
+    },
     async stageMarket(input) {
-      await services.commands.dispatch('mod.install', {
-        ref: input.ref,
-        instance: input.instanceId,
-        dependencies: false,
-      })
+      const policy = input.dependencies ?? 'required'
+      const plan = await this.planMarket!(input)
+      if (policy === 'required' && plan.blocked.length > 0) {
+        return { staged: false, policy, files: [], plan }
+      }
+      const refs = policy === 'none' ? [input.ref] : plan.install.map((item) => item.ref)
+      for (const ref of refs) {
+        await services.commands.dispatch(
+          'mod.install',
+          { ref, instance: input.instanceId, dependencies: false },
+          { mode: 'cli', signal: input.signal },
+        )
+      }
       const manifest = await services.install.getInstanceInstallManifest(input.instanceId)
-      return { files: manifest?.files?.map((file) => file.path) ?? [] }
+      return {
+        staged: true,
+        policy,
+        files: manifest?.files?.map((file) => file.path) ?? [],
+        plan,
+      }
     },
     async installStatus(instanceId) {
       const manifest = await services.install.getInstanceInstallManifest(instanceId)

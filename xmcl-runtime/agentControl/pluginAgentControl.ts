@@ -7,6 +7,14 @@ import { InstanceLogService, InstanceService } from '~/instance'
 import { InstanceInstallService } from '~/instanceIO'
 import { LaunchService } from '~/launch'
 import { ModpackService } from '~/modpack'
+import { ModrinthV2Client } from '@xmcl/modrinth'
+import { parseMarketRef } from '@xmcl/runtime-api'
+import {
+  curseforgePlan,
+  planModrinthInstall,
+  readInstalledJarHashes,
+  type DependencyPlan,
+} from './dependencies'
 import { startAgentControlHttp } from './mcpHttp'
 import { createServiceLauncherPort } from './servicePort'
 import { AgentControlHost, type SessionSnapshot } from './session'
@@ -33,6 +41,7 @@ export const pluginAgentControl: LauncherAppPlugin = (app) => {
       const processes = await app.registry.getOrCreate(LaunchService)
       const logs = await app.registry.getOrCreate(InstanceLogService)
       const commands = await app.registry.get(kCommandHost)
+      const modrinth = await app.registry.get(ModrinthV2Client)
       const port = createServiceLauncherPort({
         instances,
         install,
@@ -41,6 +50,109 @@ export const pluginAgentControl: LauncherAppPlugin = (app) => {
         processes,
         logs,
         commands,
+        dependencies: {
+          async plan(input) {
+            let parsed
+            try {
+              parsed = parseMarketRef(input.ref)
+            } catch (error) {
+              const refused: DependencyPlan = {
+                provider: 'other',
+                context: { minecraft: '', loaders: [] },
+                root: null,
+                dependencies: [],
+                blocked: [
+                  {
+                    code: 'unresolved',
+                    message: error instanceof Error ? error.message : 'The market ref is not valid.',
+                  },
+                ],
+                truncated: false,
+                install: [],
+              }
+              return refused
+            }
+            const state = await instances.getSharedInstancesState()
+            const runtime = (state.all[input.instanceId]?.runtime ?? {}) as {
+              minecraft?: string
+              fabricLoader?: string
+              forge?: string
+              quiltLoader?: string
+              neoForged?: string
+            }
+            const minecraft = runtime.minecraft ?? ''
+            const loaders = [
+              runtime.fabricLoader ? 'fabric' : '',
+              runtime.forge ? 'forge' : '',
+              runtime.quiltLoader ? 'quilt' : '',
+              runtime.neoForged ? 'neoforge' : '',
+            ].filter((loader) => loader.length > 0)
+            if (parsed.source === 'curseforge') return curseforgePlan(minecraft, loaders)
+            if (parsed.source !== 'modrinth' || !parsed.version) {
+              const refused: DependencyPlan = {
+                provider: 'other',
+                context: { minecraft, loaders },
+                root: null,
+                dependencies: [],
+                blocked: [
+                  {
+                    code: 'unresolved',
+                    message: 'Dependency inspection needs a Modrinth ref modrinth:<project>@<versionId>.',
+                  },
+                ],
+                truncated: false,
+                install: [],
+              }
+              return refused
+            }
+            const hashes = await readInstalledJarHashes(input.instanceId)
+            let installed = hashes.map((file) => ({ sha1: file.sha1 }))
+            try {
+              if (hashes.length > 0) {
+                const found = await modrinth.getProjectVersionsByHash(
+                  hashes.map((file) => file.sha1),
+                  'sha1',
+                  input.signal,
+                )
+                installed = hashes.map((file) => {
+                  const version = found[file.sha1]
+                  return version
+                    ? { sha1: file.sha1, projectId: version.project_id, versionId: version.id }
+                    : { sha1: file.sha1 }
+                })
+              }
+            } catch {
+              // Sha1 comparison still works. Project identity of other jars stays unknown.
+            }
+            return planModrinthInstall({
+              rootVersionId: parsed.version,
+              minecraft,
+              loaders,
+              includeOptional: input.includeOptional,
+              installed,
+              signal: input.signal,
+              lookup: {
+                async getVersion(versionId, signal) {
+                  try {
+                    return await modrinth.getProjectVersion(versionId, signal)
+                  } catch (error) {
+                    if (error && typeof error === 'object' && 'status' in error && error.status === 404) {
+                      return undefined
+                    }
+                    throw error
+                  }
+                },
+                getCompatibleVersions(projectId, versionLoaders, gameVersion, signal) {
+                  return modrinth.getProjectVersions(
+                    projectId,
+                    { loaders: versionLoaders, gameVersions: [gameVersion] },
+                    signal,
+                  )
+                },
+              },
+            })
+          },
+        },
       })
       const host = new AgentControlHost(port, join(directory, 'changes'))
       const saved = await readFile(join(directory, 'session.json'), 'utf8').catch(() => undefined)

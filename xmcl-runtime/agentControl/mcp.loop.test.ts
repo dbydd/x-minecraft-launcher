@@ -46,11 +46,29 @@ class FixturePort implements LauncherPort {
     return { id: asInstanceId(path), name: input.name }
   }
 
+  planMarket() {
+    return Promise.resolve({
+      provider: 'other' as const,
+      context: { minecraft: '', loaders: [] as string[] },
+      root: null,
+      dependencies: [],
+      blocked: [
+        {
+          code: 'unresolved' as const,
+          message: 'The fixture does not query a mod provider.',
+        },
+      ],
+      truncated: false,
+      limitation: 'The fixture does not query a mod provider.',
+      install: [],
+    })
+  }
+
   async stageMarket(input: { instanceId: InstanceId; ref: string }) {
     const files = [`mods/${input.ref.replace(/[^a-z0-9._-]+/gi, '_')}.txt`]
     this.staged.set(input.instanceId, files)
     this.stagedBytes.set(input.instanceId, `staged:${input.ref}`)
-    return { files }
+    return { staged: true, policy: 'required' as const, files, plan: await this.planMarket() }
   }
 
   async installStatus(instanceId: InstanceId) {

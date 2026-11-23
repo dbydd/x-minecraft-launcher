@@ -1,4 +1,5 @@
 import type { InstanceId } from '@xmcl/runtime-api'
+import type { DependencyPlan } from './dependencies'
 
 export interface LauncherProcess {
   pid: number
@@ -14,7 +15,19 @@ export interface LauncherPort {
     minecraft?: string
     fabricLoader?: string
   }): Promise<{ id: InstanceId; name: string }>
-  stageMarket(input: { instanceId: InstanceId; ref: string }): Promise<{ files: string[] }>
+  planMarket(input: {
+    instanceId: InstanceId
+    ref: string
+    includeOptional?: string[]
+    signal?: AbortSignal
+  }): Promise<DependencyPlan>
+  stageMarket(input: {
+    instanceId: InstanceId
+    ref: string
+    dependencies?: 'required' | 'none'
+    includeOptional?: string[]
+    signal?: AbortSignal
+  }): Promise<{ staged: boolean; policy: 'required' | 'none'; files: string[]; plan: DependencyPlan }>
   installStatus(
     instanceId: InstanceId,
   ): Promise<{ pending: boolean; files: string[]; oldFiles: string[] }>

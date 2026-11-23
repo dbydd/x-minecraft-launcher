@@ -75,12 +75,32 @@ describe('service launcher port', () => {
           return undefined
         },
       },
+      dependencies: {
+        async plan(input) {
+          return {
+            provider: 'modrinth',
+            context: { minecraft: '1.21.1', loaders: ['fabric'] },
+            root: {
+              projectId: 'sodium',
+              versionId: '1',
+              versionNumber: '1',
+              ref: input.ref,
+              state: 'missing',
+            },
+            dependencies: [],
+            blocked: [],
+            truncated: false,
+            install: [{ ref: input.ref, versionId: '1', role: 'root' }],
+          }
+        },
+      },
     }
     const port = createServiceLauncherPort(services)
     const staged = await port.stageMarket({
       instanceId: asInstanceId('/inst'),
       ref: 'modrinth:sodium@1',
     })
+    expect(staged.staged).toBe(true)
     expect(staged.files).toEqual(['mods/modrinth:sodium@1.jar'])
     expect(calls.some((call) => call.includes('"id":"mod.install"'))).toBe(true)
     expect(calls).not.toContain('stage-direct')

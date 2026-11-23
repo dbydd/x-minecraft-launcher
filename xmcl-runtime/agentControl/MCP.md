@@ -61,6 +61,8 @@ JSON is parsed. TOML is parsed with `smol-toml`. KubeJS files are text with a 51
 
 Mods, resource packs, and shader packs are staged with `install_stage` and copied by `install_apply`. They are not text-edited.
 
+`install_plan` inspects one Modrinth version in the instance's Minecraft version and loader. It returns required, optional, incompatible, and embedded dependencies, the selected version ref, other compatible candidates, and whether an installed jar already matches. A missing loader, a missing compatible version, a pinned version that does not fit, a version conflict, or a cycle is `blocked`. That is not reported as an empty dependency list. CurseForge dependencies are left unresolved. `install_stage` defaults to `dependencies: "required"` and stages the requested version plus required dependencies that are not already installed. Optional dependencies are staged only when `includeOptional` names their project id. A blocked plan stages nothing. `dependencies: "none"` stages only the requested ref and still returns the plan.
+
 ## Security
 
 - The command table is an allowlist. `getOfficialUserProfile`, token getters, and OS shell names are denied even if a service method exists.

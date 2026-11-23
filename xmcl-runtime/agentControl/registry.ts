@@ -364,13 +364,54 @@ export const agentCommands: readonly AgentCommand[] = [
     },
   },
   {
+    name: 'install_plan',
+    description:
+      'Inspect one Modrinth version against this instance. Returns required, optional, incompatible, and embedded dependencies. Nothing is downloaded.',
+    requiresPair: true,
+    inputSchema: objectSchema(
+      { ...instanceProp, ref: stringProp, includeOptional: { type: 'array', items: stringProp } },
+      ['instanceId', 'ref'],
+    ),
+    async run(raw, deps) {
+      const input = instanceInput
+        .extend({ ref: z.string().min(1), includeOptional: z.array(z.string().min(1)).optional() })
+        .safeParse(raw)
+      if (!input.success)
+        return failure(agentError('validation', 'install_plan requires instanceId and ref', { retryable: true }))
+      const scope = scoped(deps, asInstanceId(input.data.instanceId))
+      if ('code' in scope) return failure(scope)
+      return success(
+        await deps.port.planMarket({
+          instanceId: asInstanceId(input.data.instanceId),
+          ref: input.data.ref,
+          includeOptional: input.data.includeOptional,
+          signal: deps.signal,
+        }),
+      )
+    },
+  },
+  {
     name: 'install_stage',
     description:
-      'Stage one market ref through the launcher mod.install command. Nothing is copied until install_apply.',
+      'Stage a market ref and, by default, its required Modrinth dependencies. Optional dependencies stay out unless includeOptional names them. A blocked plan stages nothing. Nothing is copied until install_apply.',
     requiresPair: true,
-    inputSchema: objectSchema({ ...instanceProp, ref: stringProp }, ['instanceId', 'ref']),
+    inputSchema: objectSchema(
+      {
+        ...instanceProp,
+        ref: stringProp,
+        dependencies: { type: 'string', enum: ['required', 'none'] },
+        includeOptional: { type: 'array', items: stringProp },
+      },
+      ['instanceId', 'ref'],
+    ),
     async run(raw, deps) {
-      const input = instanceInput.extend({ ref: z.string().min(1) }).safeParse(raw)
+      const input = instanceInput
+        .extend({
+          ref: z.string().min(1),
+          dependencies: z.enum(['required', 'none']).optional(),
+          includeOptional: z.array(z.string().min(1)).optional(),
+        })
+        .safeParse(raw)
       if (!input.success)
         return failure(
           agentError('validation', 'install_stage requires instanceId and ref', {
@@ -383,6 +424,9 @@ export const agentCommands: readonly AgentCommand[] = [
         await deps.port.stageMarket({
           instanceId: asInstanceId(input.data.instanceId),
           ref: input.data.ref,
+          dependencies: input.data.dependencies,
+          includeOptional: input.data.includeOptional,
+          signal: deps.signal,
         }),
       )
     },
