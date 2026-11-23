@@ -8,6 +8,7 @@ import { pluginMultiplayer } from './pluginMultiplayer'
 
 import { pluginApiFallback } from '@xmcl/runtime/app/pluginApiFallback'
 import { pluginAgentProtocol } from '@xmcl/runtime/agent'
+import { pluginAgentControl } from '@xmcl/runtime/agentControl/pluginAgentControl'
 import { pluginCommonProtocol } from '@xmcl/runtime/app/pluginCommonProtocol'
 import { pluginMediaProtocol } from '@xmcl/runtime/app/pluginMediaProtocol'
 import { pluginCli } from '@xmcl/runtime/commands/pluginCli'
@@ -53,6 +54,7 @@ export const definedPlugins: LauncherAppPlugin[] = [
   pluginMultiplayer,
   pluginAgentDocuments,
   pluginAgentProtocol,
+  pluginAgentControl,
   pluginCommandHost({ services: definedServices }),
   pluginCli,
   pluginAutoUpdate,
